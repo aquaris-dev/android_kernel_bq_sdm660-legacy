@@ -39,6 +39,12 @@
 			pr_debug("%s: %s: " fmt, chg->name,	\
 				__func__, ##__VA_ARGS__);	\
 	} while (0)
+bool USB_detect_flag = 0;
+#ifdef CONFIG_PTN36502
+extern void set_ptn36502_safe_state_mode (void);
+extern void set_ptn36502_usp_3p0_only_mode (int cc_orient_reversed);
+extern u8 is_ptn36502_safe_mode;
+#endif
 
 static bool is_secure(struct smb_charger *chg, int addr)
 {
@@ -448,6 +454,7 @@ static int smblib_set_adapter_allowance(struct smb_charger *chg,
 }
 
 #define MICRO_5V	5000000
+#define MICRO_6V5	6500000
 #define MICRO_9V	9000000
 #define MICRO_12V	12000000
 static int smblib_set_usb_pd_allowed_voltage(struct smb_charger *chg,
@@ -1887,6 +1894,30 @@ int smblib_set_prop_input_suspend(struct smb_charger *chg,
 	return rc;
 }
 
+int lct_set_prop_input_suspend(struct smb_charger *chg,
+				  const union power_supply_propval *val)
+{
+	int rc = 0;
+	union power_supply_propval pval = {0, };
+
+	pr_err("[%s] val=%d\n", __func__, val->intval);
+	if (val->intval) {
+		pval.intval = 0;
+
+		smblib_set_prop_input_suspend(chg, &pval);
+	} else {
+		pval.intval = 1;
+		chg->pl_psy =  power_supply_get_by_name("parallel");
+		if (chg->pl_psy) {
+			power_supply_set_property(chg->pl_psy, POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
+		}
+		smblib_set_prop_input_suspend(chg, &pval);
+
+	}
+	power_supply_changed(chg->batt_psy);
+	return rc;
+}
+
 int smblib_set_prop_batt_capacity(struct smb_charger *chg,
 				  const union power_supply_propval *val)
 {
@@ -2202,6 +2233,30 @@ int smblib_get_prop_usb_present(struct smb_charger *chg,
 	}
 
 	val->intval = (bool)(stat & USBIN_PLUGIN_RT_STS_BIT);
+	USB_detect_flag = val->intval;
+	return 0;
+}
+
+int smblib_get_prop_usb_health(struct smb_charger *chg,
+				union power_supply_propval *val)
+{
+	int rc;
+	u8 stat;
+
+	rc = smblib_read(chg, USBIN_BASE + INT_RT_STS_OFFSET, &stat);
+	if (rc < 0) {
+		smblib_err(chg, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
+		return rc;
+	}
+
+	if (stat & USBIN_OV_RT_STS_BIT) {
+		val->intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+	} else if (stat & USBIN_PLUGIN_RT_STS_BIT) {
+		val->intval = POWER_SUPPLY_HEALTH_GOOD;
+	} else {
+		val->intval = POWER_SUPPLY_HEALTH_UNKNOWN;
+	}
+
 	return 0;
 }
 
@@ -2235,6 +2290,11 @@ int smblib_get_prop_usb_voltage_max(struct smb_charger *chg,
 {
 	switch (chg->real_charger_type) {
 	case POWER_SUPPLY_TYPE_USB_HVDCP:
+		val->intval = MICRO_9V;
+		break;
+	case POWER_SUPPLY_TYPE_USB_HVDCP_3:
+		val->intval = MICRO_6V5;
+		break;
 	case POWER_SUPPLY_TYPE_USB_PD:
 		if (chg->smb_version == PM660_SUBTYPE)
 			val->intval = MICRO_9V;
@@ -3097,7 +3157,6 @@ int smblib_get_charge_current(struct smb_charger *chg,
 		*total_current_ua = HVDCP_CURRENT_UA;
 		return 0;
 	}
-
 	if (non_compliant) {
 		switch (apsd_result->bit) {
 		case CDP_CHARGER_BIT:
@@ -3116,7 +3175,6 @@ int smblib_get_charge_current(struct smb_charger *chg,
 		*total_current_ua = max(current_ua, val.intval);
 		return 0;
 	}
-
 	switch (typec_source_rd) {
 	case POWER_SUPPLY_TYPEC_SOURCE_DEFAULT:
 		switch (apsd_result->bit) {
@@ -3271,6 +3329,14 @@ irqreturn_t smblib_handle_usbin_uv(int irq, void *data)
 	struct smb_charger *chg = irq_data->parent_data;
 	struct storm_watch *wdata;
 
+	const union power_supply_propval val = {1, };
+	lct_set_prop_input_suspend(chg, &val);//usb plugout reset input_suspend 0
+	chg->charging_enabled = 1;
+	chg->pl.psy = power_supply_get_by_name("parallel");
+	if (!!chg->pl.psy)
+	power_supply_set_property(chg->pl.psy,
+		POWER_SUPPLY_PROP_INPUT_SUSPEND, &val);
+
 	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
 	if (!chg->irq_info[SWITCH_POWER_OK_IRQ].irq_data)
 		return IRQ_HANDLED;
@@ -3341,6 +3407,8 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 	struct smb_irq_data *data;
 	struct storm_watch *wdata;
 
+	union power_supply_propval pval = {1, };
+
 	rc = smblib_read(chg, USBIN_BASE + INT_RT_STS_OFFSET, &stat);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read USB_INT_RT_STS rc=%d\n", rc);
@@ -3355,6 +3423,11 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 		rc = smblib_request_dpdm(chg, true);
 		if (rc < 0)
 			smblib_err(chg, "Couldn't to enable DPDM rc=%d\n", rc);
+
+		chg->pl_psy =  power_supply_get_by_name("parallel");
+		if (chg->pl_psy) {
+			power_supply_set_property(chg->pl_psy, POWER_SUPPLY_PROP_INPUT_SUSPEND, &pval);
+		}
 
 		/* Schedule work to enable parallel charger */
 		vote(chg->awake_votable, PL_DELAY_VOTER, true, 0);
@@ -3633,7 +3706,6 @@ static void smblib_force_legacy_icl(struct smb_charger *chg, int pst)
 	/* while PD is active it should have complete ICL control */
 	if (chg->pd_active)
 		return;
-
 	switch (pst) {
 	case POWER_SUPPLY_TYPE_USB:
 		/*
@@ -3822,6 +3894,15 @@ static void smblib_handle_typec_removal(struct smb_charger *chg)
 	struct smb_irq_data *data;
 	struct storm_watch *wdata;
 
+#ifdef CONFIG_PTN36502
+	printk("smblib_handle_typec_removal  is_ptn36502_safe_mode=%d\n", is_ptn36502_safe_mode);
+	if(is_ptn36502_safe_mode == 0) {
+		set_ptn36502_safe_state_mode();
+		is_ptn36502_safe_mode = 1;
+		printk("smblib_handle_typec_removal 11 is_ptn36502_safe_mode=%d\n", is_ptn36502_safe_mode);
+	}
+#endif
+
 	chg->cc2_detach_wa_active = false;
 
 	rc = smblib_request_dpdm(chg, false);
@@ -3969,6 +4050,18 @@ unlock:
 static void smblib_handle_typec_insertion(struct smb_charger *chg)
 {
 	int rc;
+#ifdef CONFIG_PTN36502
+	union power_supply_propval val;
+
+	smblib_get_prop_typec_cc_orientation(chg, &val);
+	printk("smblib_handle_typec_insertion val.intval = %d \n",val.intval);
+	printk("smblib_handle_typec_insertion is_ptn36502_safe_mode = %d \n",is_ptn36502_safe_mode);
+
+	if(is_ptn36502_safe_mode == 1) {
+		set_ptn36502_usp_3p0_only_mode(val.intval);
+		is_ptn36502_safe_mode = 0;
+	}
+#endif
 
 	vote(chg->pd_disallowed_votable_indirect, CC_DETACHED_VOTER, false, 0);
 

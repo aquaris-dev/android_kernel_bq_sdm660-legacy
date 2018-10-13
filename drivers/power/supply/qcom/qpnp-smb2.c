@@ -28,8 +28,12 @@
 #include "smb-lib.h"
 #include "storm-watch.h"
 #include <linux/pmic-voter.h>
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
+#include <linux/qpnp/qpnp-adc.h>
 
 #define SMB2_DEFAULT_WPWR_UW	8000000
+#define PROTECT_TEMP_DELAY_MS	2000
 
 static struct smb_params v1_params = {
 	.fcc			= {
@@ -196,6 +200,36 @@ module_param_named(
 #define BITE_WDOG_TIMEOUT_8S		0x3
 #define BARK_WDOG_TIMEOUT_MASK		GENMASK(3, 2)
 #define BARK_WDOG_TIMEOUT_SHIFT		2
+
+bool is_delay_work_working = false;
+void set_charging_protect(int enable)
+{
+	int value=0,gpio45=45;
+	value = gpio_get_value(gpio45);
+	pr_debug("gpio45 previous value is %d\n",value);
+	gpio_direction_output(gpio45, enable);
+	value = gpio_get_value(gpio45);
+	pr_debug("gpio45 set to output value = %d\n",value);
+}
+
+static int get_usb_temp_value(struct smb_charger *chg){
+	int rc, on;
+	struct qpnp_vadc_result results;
+	chg->vadc_dev = qpnp_get_vadc(chg->dev, "usb_therm");
+	if (IS_ERR(chg->vadc_dev)) {
+		pr_err("could not get vadc_dev\n");
+		rc = PTR_ERR(chg->vadc_dev);
+	}
+
+	rc = qpnp_vadc_read(chg->vadc_dev, VADC_AMUX_THM4_PU2, &results);
+	if (rc) {
+		pr_err("Unable to read VADC_AMUX_THM4_PU2 rc=%d\n", rc);
+	}
+	on = (int)results.physical;
+	pr_debug("Read VADC_AMUX_THM4_PU2, value=%d\n", on);
+	return on;
+}
+
 static int smb2_parse_dt(struct smb2 *chip)
 {
 	struct smb_charger *chg = &chip->chg;
@@ -320,6 +354,9 @@ static int smb2_parse_dt(struct smb2 *chip)
 	if (rc < 0)
 		chg->otg_delay_ms = OTG_DEFAULT_DEGLITCH_TIME_MS;
 
+	chg->protect_temp_by_d_work= of_property_read_bool(node,
+								"qcom,protect-temp-by-d-work");
+
 	return 0;
 }
 
@@ -351,6 +388,7 @@ static enum power_supply_property smb2_usb_props[] = {
 	POWER_SUPPLY_PROP_PD_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_PD_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_SDP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_HEALTH,
 };
 
 static int smb2_usb_get_prop(struct power_supply *psy,
@@ -367,6 +405,25 @@ static int smb2_usb_get_prop(struct power_supply *psy,
 			val->intval = 1;
 		else
 			rc = smblib_get_prop_usb_present(chg, val);
+
+		if(val->intval) {
+			if(chg->protect_temp_by_d_work && !is_delay_work_working) {
+				is_delay_work_working = true;
+				wake_lock(&chg->protect_temp_wakelock);
+				pr_info("Protection task enabled: bq_protect_temp_wakelock acquired\n");
+				schedule_delayed_work(&chg->protect_temp_work,
+					msecs_to_jiffies(PROTECT_TEMP_DELAY_MS));
+			}
+		}else{
+			if(chg->protect_temp_by_d_work && is_delay_work_working &&
+				gpio_get_value(45) == 0) {
+				cancel_delayed_work(&chg->protect_temp_work);
+				wake_unlock(&chg->protect_temp_wakelock);
+				pr_info("Protection task disabled: bq_protect_temp_wakelock released\n");
+				is_delay_work_working = false;
+			}
+		}
+
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		rc = smblib_get_prop_usb_online(chg, val);
@@ -465,6 +522,9 @@ static int smb2_usb_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_SDP_CURRENT_MAX:
 		val->intval = get_client_vote(chg->usb_icl_votable,
 					      USB_PSY_VOTER);
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		rc = smblib_get_prop_usb_health(chg, val);
 		break;
 	default:
 		pr_err("get prop %d is not supported in usb\n", psp);
@@ -585,6 +645,7 @@ static enum power_supply_property smb2_usb_port_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_HEALTH,
 };
 
 static int smb2_usb_port_get_prop(struct power_supply *psy,
@@ -598,6 +659,9 @@ static int smb2_usb_port_get_prop(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_TYPE:
 		val->intval = POWER_SUPPLY_TYPE_USB;
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		rc = smblib_get_prop_usb_health(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		rc = smblib_get_prop_usb_online(chg, val);
@@ -928,6 +992,7 @@ static enum power_supply_property smb2_batt_props[] = {
 	POWER_SUPPLY_PROP_RERUN_AICL,
 	POWER_SUPPLY_PROP_DP_DM,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CHARGING_ENABLED,
 };
 
 static int smb2_batt_get_prop(struct power_supply *psy,
@@ -939,6 +1004,11 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 	union power_supply_propval pval = {0, };
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+		smblib_get_prop_batt_status(chg, val);
+		if (val->intval != POWER_SUPPLY_STATUS_CHARGING)
+			val->intval = 0;
+		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		rc = smblib_get_prop_batt_status(chg, val);
 		break;
@@ -1057,6 +1127,9 @@ static int smb2_batt_set_prop(struct power_supply *psy,
 	struct smb_charger *chg = power_supply_get_drvdata(psy);
 
 	switch (prop) {
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+		rc = lct_set_prop_input_suspend(chg, val);
+		break;
 	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
 		rc = smblib_set_prop_input_suspend(chg, val);
 		break;
@@ -1150,6 +1223,7 @@ static int smb2_batt_prop_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED:
 	case POWER_SUPPLY_PROP_STEP_CHARGING_ENABLED:
 	case POWER_SUPPLY_PROP_SW_JEITA_ENABLED:
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
 		return 1;
 	default:
 		break;
@@ -2212,12 +2286,47 @@ static void smb2_create_debugfs(struct smb2 *chip)
 
 #endif
 
+static void bq_protect_temp_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work,
+				struct smb_charger,
+				protect_temp_work.work);
+	union power_supply_propval val;
+	int temp;
+
+	temp = get_usb_temp_value(chg);
+	if(temp >= 110) {
+		if(gpio_get_value(45) != 1) {
+			set_charging_protect(1);
+			pr_info("Trigger protection, temp (%d) >= 110\n", temp);
+		}
+	} else if(temp <= 60) {
+		if(gpio_get_value(45) != 0) {
+			set_charging_protect(0);
+			pr_info("Release protection, temp (%d) <= 60\n",temp);
+		}
+	}
+	smblib_get_prop_usb_present(chg, &val);
+
+	if (temp > 60 || val.intval) {
+		schedule_delayed_work(&chg->protect_temp_work,
+					msecs_to_jiffies(PROTECT_TEMP_DELAY_MS));
+	} else {
+		pr_info("Release protection, temp (%d) <= 60 or USB not present\n",temp);
+		pr_info("bq_protect_temp_wakelock released\n");
+		wake_unlock(&chg->protect_temp_wakelock);
+		is_delay_work_working = false;
+	}
+	return;
+}
+
 static int smb2_probe(struct platform_device *pdev)
 {
 	struct smb2 *chip;
 	struct smb_charger *chg;
 	int rc = 0;
 	union power_supply_propval val;
+
 	int usb_present, batt_present, batt_health, batt_charge_type;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -2250,6 +2359,14 @@ static int smb2_probe(struct platform_device *pdev)
 	if (rc < 0) {
 		pr_err("Couldn't parse device tree rc=%d\n", rc);
 		goto cleanup;
+	}
+
+	INIT_DELAYED_WORK(&chg->protect_temp_work, bq_protect_temp_work);
+	rc = gpio_request(chg->gpio45, "protect_temp_gpio");
+	if (rc) {
+		pr_err("%s: unable to request protect_temp gpio [%d]\n",
+				__func__,
+				chg->gpio45);
 	}
 
 	rc = smblib_init(chg);
@@ -2376,7 +2493,11 @@ static int smb2_probe(struct platform_device *pdev)
 	}
 	batt_charge_type = val.intval;
 
+	wake_lock_init(&chg->protect_temp_wakelock, WAKE_LOCK_SUSPEND, "protect_temp_wakelock");
+
 	device_init_wakeup(chg->dev, true);
+
+	set_charging_protect(0);
 
 	pr_info("QPNP SMB2 probed successfully usb:present=%d type=%d batt:present = %d health = %d charge = %d\n",
 		usb_present, chg->real_charger_type,
@@ -2416,6 +2537,8 @@ static int smb2_remove(struct platform_device *pdev)
 	power_supply_unregister(chg->usb_port_psy);
 	regulator_unregister(chg->vconn_vreg->rdev);
 	regulator_unregister(chg->vbus_vreg->rdev);
+
+	wake_lock_destroy(&chg->protect_temp_wakelock);
 
 	platform_set_drvdata(pdev, NULL);
 	return 0;
